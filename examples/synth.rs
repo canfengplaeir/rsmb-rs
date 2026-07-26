@@ -57,8 +57,8 @@ fn main() {
     let g_cur = flow::Gray::from_rgb(&f_cur, W, H);
     let g_next = flow::Gray::from_rgb(&f_next, W, H);
 
-    let fwd = flow::median_flow(&flow::optical_flow(&g_cur, &g_next, 7, 5));
-    let bwd = flow::median_flow(&flow::optical_flow(&g_cur, &g_prev, 7, 5));
+    let fwd = flow::median_flow(&flow::optical_flow(&g_cur, &g_next, 7, 5, 0));
+    let bwd = flow::median_flow(&flow::optical_flow(&g_cur, &g_prev, 7, 5, 0));
 
     // Sanity: mean flow magnitude near the square should approach (DX, DY).
     let mut su = 0.0;

@@ -15,6 +15,7 @@ pub struct VideoInfo {
     pub width: usize,
     pub height: usize,
     pub fps: f64,
+    pub total_frames: u64,
 }
 
 /// Locate ffprobe next to the chosen ffmpeg binary (same package family).
@@ -34,7 +35,7 @@ pub fn probe(ffmpeg: &str, input: &Path) -> Result<VideoInfo> {
         .args([
             "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,r_frame_rate",
+            "-show_entries", "stream=width,height,r_frame_rate,nb_frames,duration",
             "-of", "csv=p=0",
         ])
         .arg(input)
@@ -61,7 +62,24 @@ pub fn probe(ffmpeg: &str, input: &Path) -> Result<VideoInfo> {
     if width == 0 || height == 0 || fps <= 0.0 {
         return Err(anyhow!("invalid stream info: {line}"));
     }
-    Ok(VideoInfo { width, height, fps })
+    let total_frames: u64 = if parts.len() >= 4 {
+        parts[3].parse().unwrap_or(0)
+    } else {
+        0
+    };
+    let total_frames = if total_frames > 0 {
+        total_frames
+    } else if parts.len() >= 5 {
+        let duration: f64 = parts[4].parse().unwrap_or(0.0);
+        if duration > 0.0 {
+            (duration * fps).ceil() as u64
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    Ok(VideoInfo { width, height, fps, total_frames })
 }
 
 fn parse_rate(s: &str) -> Result<f64> {

@@ -12,10 +12,12 @@ mod blur;
 mod flow;
 mod video;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -60,6 +62,15 @@ struct Args {
     /// Path to the ffmpeg binary.
     #[arg(long, default_value = "ffmpeg")]
     ffmpeg: String,
+
+    /// Max pyramid levels for optical flow (0 = auto, 1-6 = fixed).
+    /// Fewer levels = faster but less accurate for large motion.
+    #[arg(long, default_value_t = 0)]
+    levels: usize,
+
+    /// Reuse forward flow as negated backward flow (faster, minor quality loss).
+    #[arg(long)]
+    flow_cache: bool,
 }
 
 fn main() -> Result<()> {
@@ -71,19 +82,24 @@ fn main() -> Result<()> {
     let info = video::probe(&args.ffmpeg, &args.input)?;
     let (w, h) = (info.width, info.height);
     let frame_size = w * h * 3;
-    println!(
-        "input : {} ({}x{} @ {:.3} fps)",
-        args.input.display(),
-        w,
-        h,
-        info.fps
-    );
-    println!(
-        "params: shutter={}° samples={} window={} iters={} crf={} preset={}",
-        args.shutter, args.samples, args.window, args.iters, args.crf, args.preset
-    );
 
-    let mut decoder = video::Decoder::new(&args.ffmpeg, &args.input)?;
+    let (raw_tx, raw_rx) = mpsc::sync_channel::<Option<Vec<u8>>>(16);
+    let (proc_tx, proc_rx) = mpsc::sync_channel::<Vec<u8>>(8);
+
+    let dec_ffmpeg = args.ffmpeg.clone();
+    let dec_input = args.input.clone();
+    let dec_handle = thread::spawn(move || -> Result<()> {
+        let mut dec = video::Decoder::new(&dec_ffmpeg, &dec_input)?;
+        let mut buf = vec![0u8; frame_size];
+        while dec.read_frame(&mut buf)? {
+            if raw_tx.send(Some(buf.clone())).is_err() {
+                break;
+            }
+        }
+        let _ = raw_tx.send(None);
+        dec.finish()
+    });
+
     let mut encoder = video::Encoder::new(
         &args.ffmpeg,
         &args.input,
@@ -94,79 +110,161 @@ fn main() -> Result<()> {
         args.crf,
         &args.preset,
     )?;
+    let enc_handle = thread::spawn(move || -> Result<()> {
+        while let Ok(frame) = proc_rx.recv() {
+            encoder.write_frame(&frame)?;
+        }
+        encoder.finish()
+    });
 
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} frame {pos} | {elapsed_precise} | {per_sec}")
-            .unwrap(),
-    );
+    let pb = if info.total_frames > 0 {
+        let pb = ProgressBar::new(info.total_frames);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{bar:40.green/black} {pos:>6}/{len:6} [{elapsed_precise} | {eta}] {per_sec}",
+            )
+            .unwrap()
+            .progress_chars("█▉▊▋▌▍▎▏ "),
+        );
+        pb
+    } else {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template("{spinner:.green} frame {pos} | {elapsed_precise} | {per_sec}")
+                .unwrap(),
+        );
+        pb
+    };
+    pb.println(format!(
+        "input : {} ({}x{} @ {:.3} fps, {} frames)",
+        args.input.display(),
+        w,
+        h,
+        info.fps,
+        if info.total_frames > 0 { info.total_frames.to_string() } else { "?".into() }
+    ));
+    pb.println(format!(
+        "params: shutter={}° samples={} window={} iters={} crf={} preset={}",
+        args.shutter, args.samples, args.window, args.iters, args.crf, args.preset
+    ));
 
-    // Sliding three-frame window: prev / cur / next.
     let mut prev = vec![0u8; frame_size];
-    let mut cur = vec![0u8; frame_size];
-    let mut next = vec![0u8; frame_size];
+    let mut cur: Vec<u8>;
+    let mut next: Vec<u8>;
+    let has_next: bool;
 
-    // Prime the pipeline with the first two frames.
-    if !decoder.read_frame(&mut cur)? {
-        anyhow::bail!("input video has no frames");
+    match raw_rx.recv() {
+        Ok(Some(f)) => cur = f,
+        Ok(None) => anyhow::bail!("input video has no frames"),
+        Err(_) => anyhow::bail!("decoder failed unexpectedly"),
     }
-    let has_next = decoder.read_frame(&mut next)?;
+    match raw_rx.recv() {
+        Ok(Some(f)) => { next = f; has_next = true; }
+        Ok(None) => { next = vec![0u8; frame_size]; next.copy_from_slice(&cur); has_next = false; }
+        Err(_) => { next = vec![0u8; frame_size]; next.copy_from_slice(&cur); has_next = false; }
+    }
+
+    let mut flow_cache: Option<(Vec<f32>, Vec<f32>, usize, usize)> = None;
 
     let mut n: u64 = 0;
     loop {
         let processed = if args.shutter <= 0.0 {
             cur.clone()
         } else {
-            // For the first/last frame the missing neighbour is duplicated,
-            // which simply halves the shutter on that side.
             let gray_prev = flow::Gray::from_rgb(if n == 0 { &cur } else { &prev }, w, h);
             let gray_cur = flow::Gray::from_rgb(&cur, w, h);
             let gray_next = flow::Gray::from_rgb(if has_next { &next } else { &cur }, w, h);
 
-            let fwd = flow::median_flow(&flow::optical_flow(
-                &gray_cur, &gray_next, args.window, args.iters,
-            ));
-            let bwd = flow::median_flow(&flow::optical_flow(
-                &gray_cur, &gray_prev, args.window, args.iters,
-            ));
+            let (fwd, bwd) = if args.flow_cache {
+                if let Some((cu, cv, cw, ch)) = flow_cache.take() {
+                    let neg_u: Vec<f32> = cu.iter().map(|v| -v).collect();
+                    let neg_v: Vec<f32> = cv.iter().map(|v| -v).collect();
+                    let bwd = flow::FlowField { w: cw, h: ch, u: neg_u, v: neg_v };
+                    let fwd = flow::median_flow(&flow::optical_flow(
+                        &gray_cur, &gray_next, args.window, args.iters, args.levels,
+                    ));
+                    flow_cache = Some((fwd.u.clone(), fwd.v.clone(), fwd.w, fwd.h));
+                    (fwd, bwd)
+                } else {
+                    let (fwd, bwd) = rayon::join(
+                        || flow::median_flow(&flow::optical_flow(
+                            &gray_cur, &gray_next, args.window, args.iters, args.levels,
+                        )),
+                        || flow::median_flow(&flow::optical_flow(
+                            &gray_cur, &gray_prev, args.window, args.iters, args.levels,
+                        )),
+                    );
+                    flow_cache = Some((fwd.u.clone(), fwd.v.clone(), fwd.w, fwd.h));
+                    (fwd, bwd)
+                }
+            } else {
+                rayon::join(
+                    || flow::median_flow(&flow::optical_flow(
+                        &gray_cur, &gray_next, args.window, args.iters, args.levels,
+                    )),
+                    || flow::median_flow(&flow::optical_flow(
+                        &gray_cur, &gray_prev, args.window, args.iters, args.levels,
+                    )),
+                )
+            };
 
             blur::motion_blur(&cur, w, h, &fwd, &bwd, args.shutter, args.samples)
         };
-        encoder.write_frame(&processed)?;
+
+        if proc_tx.send(processed).is_err() {
+            anyhow::bail!("encoder channel closed unexpectedly");
+        }
         n += 1;
         pb.set_position(n);
 
         if !has_next {
             break;
         }
+
         std::mem::swap(&mut prev, &mut cur);
         std::mem::swap(&mut cur, &mut next);
-        // After the swap `next` holds the old `cur` buffer (scratch space).
-        let got = decoder.read_frame(&mut next)?;
-        if !got {
-            // One last frame to emit with the duplicated-neighbour path.
-            let gray_prev = flow::Gray::from_rgb(&prev, w, h);
-            let gray_cur = flow::Gray::from_rgb(&cur, w, h);
-            let fwd = flow::median_flow(&flow::optical_flow(
-                &gray_cur, &gray_cur, args.window, args.iters,
-            ));
-            let bwd = flow::median_flow(&flow::optical_flow(
-                &gray_cur, &gray_prev, args.window, args.iters,
-            ));
-            let processed = if args.shutter <= 0.0 {
-                cur.clone()
-            } else {
-                blur::motion_blur(&cur, w, h, &fwd, &bwd, args.shutter, args.samples)
-            };
-            encoder.write_frame(&processed)?;
-            n += 1;
-            pb.set_position(n);
-            break;
+
+        match raw_rx.recv() {
+            Ok(Some(frame)) => {
+                next = frame;
+            }
+            Ok(None) => {
+                let gray_prev = flow::Gray::from_rgb(&prev, w, h);
+                let gray_cur = flow::Gray::from_rgb(&cur, w, h);
+
+                let (fwd, bwd) = rayon::join(
+                    || flow::median_flow(&flow::optical_flow(
+                        &gray_cur, &gray_cur, args.window, args.iters, args.levels,
+                    )),
+                    || flow::median_flow(&flow::optical_flow(
+                        &gray_cur, &gray_prev, args.window, args.iters, args.levels,
+                    )),
+                );
+
+                let processed = if args.shutter <= 0.0 {
+                    cur.clone()
+                } else {
+                    blur::motion_blur(&cur, w, h, &fwd, &bwd, args.shutter, args.samples)
+                };
+
+                if proc_tx.send(processed).is_err() {
+                    anyhow::bail!("encoder channel closed unexpectedly");
+                }
+                n += 1;
+                pb.set_position(n);
+                break;
+            }
+            Err(_) => {
+                anyhow::bail!("decoder failed unexpectedly");
+            }
         }
     }
 
-    decoder.finish().context("decoder error")?;
-    encoder.finish().context("encoder error")?;
+    drop(proc_tx);
+
+    dec_handle.join().map_err(|_| anyhow::anyhow!("decoder thread panicked"))??;
+    enc_handle.join().map_err(|_| anyhow::anyhow!("encoder thread panicked"))??;
+
     pb.finish_with_message(format!("done — {} frames", n));
     println!("output: {}", args.output.display());
     Ok(())

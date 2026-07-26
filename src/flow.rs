@@ -158,13 +158,13 @@ pub fn auto_levels(w: usize, h: usize) -> usize {
 fn box_filter(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     // Row prefix sums: rp[y][x+1] = sum of src[y][0..=x]
     let mut rp = vec![0.0f32; h * (w + 1)];
-    for y in 0..h {
+    rp.par_chunks_mut(w + 1).enumerate().for_each(|(y, row_rp)| {
         let mut acc = 0.0;
         for x in 0..w {
             acc += src[y * w + x];
-            rp[y * (w + 1) + x + 1] = acc;
+            row_rp[x + 1] = acc;
         }
-    }
+    });
     // Horizontal window sums.
     let mut tmp = vec![0.0f32; w * h];
     tmp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
@@ -177,13 +177,16 @@ fn box_filter(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     });
     // Column prefix sums on tmp: cp[x][y+1] = sum of tmp[0..=y][x]
     let mut cp = vec![0.0f32; w * (h + 1)];
-    for x in 0..w {
+    cp.par_chunks_mut(h + 1).enumerate().for_each(|(x, col_cp)| {
+        if x >= w {
+            return;
+        }
         let mut acc = 0.0;
         for y in 0..h {
             acc += tmp[y * w + x];
-            cp[x * (h + 1) + y + 1] = acc;
+            col_cp[y + 1] = acc;
         }
-    }
+    });
     let mut dst = vec![0.0f32; w * h];
     dst.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         let lo = y.saturating_sub(r);
@@ -204,26 +207,34 @@ fn lk_level(a: &Gray, b: &Gray, flow: &mut FlowField, win_r: usize, iters: usize
     // Spatial gradients of the reference image (central differences).
     let mut ix = vec![0.0f32; w * h];
     let mut iy = vec![0.0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let xm = x.saturating_sub(1);
-            let xp = (x + 1).min(w - 1);
-            let ym = y.saturating_sub(1);
-            let yp = (y + 1).min(h - 1);
-            ix[y * w + x] = 0.5 * (a.at(xp, y) - a.at(xm, y));
-            iy[y * w + x] = 0.5 * (a.at(x, yp) - a.at(x, ym));
-        }
-    }
+    ix.par_chunks_mut(w)
+        .zip(iy.par_chunks_mut(w))
+        .enumerate()
+        .for_each(|(y, (row_x, row_y))| {
+            for x in 0..w {
+                let xm = x.saturating_sub(1);
+                let xp = (x + 1).min(w - 1);
+                let ym = y.saturating_sub(1);
+                let yp = (y + 1).min(h - 1);
+                row_x[x] = 0.5 * (a.at(xp, y) - a.at(xm, y));
+                row_y[x] = 0.5 * (a.at(x, yp) - a.at(x, ym));
+            }
+        });
 
     // Structure tensor terms that do not change between iterations.
-    let ixx = box_filter(&ix.iter().map(|v| v * v).collect::<Vec<_>>(), w, h, win_r);
-    let iyy = box_filter(&iy.iter().map(|v| v * v).collect::<Vec<_>>(), w, h, win_r);
-    let ixy = box_filter(
-        &ix.iter().zip(&iy).map(|(a, b)| a * b).collect::<Vec<_>>(),
-        w,
-        h,
-        win_r,
-    );
+    let ix_sq: Vec<f32> = ix.par_iter().map(|v| v * v).collect();
+    let iy_sq: Vec<f32> = iy.par_iter().map(|v| v * v).collect();
+    let ix_iy: Vec<f32> = ix.par_iter().zip(&iy).map(|(a, b)| a * b).collect();
+    let (ixx, iyy, ixy) = {
+        let (b1, (b2, b3)) = rayon::join(
+            || box_filter(&ix_sq, w, h, win_r),
+            || rayon::join(
+                || box_filter(&iy_sq, w, h, win_r),
+                || box_filter(&ix_iy, w, h, win_r),
+            ),
+        );
+        (b1, b2, b3)
+    };
 
     for _ in 0..iters {
         // Temporal gradient: warped B minus A.
@@ -241,8 +252,10 @@ fn lk_level(a: &Gray, b: &Gray, flow: &mut FlowField, win_r: usize, iters: usize
                     row_yt[x] = iy[i] * it;
                 }
             });
-        let sxt = box_filter(&ixt, w, h, win_r);
-        let syt = box_filter(&iyt, w, h, win_r);
+        let (sxt, syt) = rayon::join(
+            || box_filter(&ixt, w, h, win_r),
+            || box_filter(&iyt, w, h, win_r),
+        );
 
         // Solve the 2x2 normal equations per pixel, with Tikhonov
         // regularisation to stay stable in flat regions.
@@ -319,26 +332,29 @@ pub fn median_flow(flow: &FlowField) -> FlowField {
                         n += 1;
                     }
                 }
-                win.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                win.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
                 row[x] = win[4];
             }
         });
         out
     };
+    let (u, v) = rayon::join(|| filter(&flow.u), || filter(&flow.v));
     FlowField {
         w: flow.w,
         h: flow.h,
-        u: filter(&flow.u),
-        v: filter(&flow.v),
+        u,
+        v,
     }
 }
 
 /// Full pyramidal Lucas-Kanade: returns the motion of every pixel of `a`
 /// toward image `b`, in pixels at full resolution.
-pub fn optical_flow(a: &Gray, b: &Gray, win_r: usize, iters: usize) -> FlowField {
-    let levels = auto_levels(a.w, a.h);
-    let pa = build_pyramid(a, levels);
-    let pb = build_pyramid(b, levels);
+pub fn optical_flow(a: &Gray, b: &Gray, win_r: usize, iters: usize, levels: usize) -> FlowField {
+    let levels = if levels > 0 { levels.min(6) } else { auto_levels(a.w, a.h) };
+    let (pa, pb) = rayon::join(
+        || build_pyramid(a, levels),
+        || build_pyramid(b, levels),
+    );
 
     let coarse = pa.last().unwrap();
     let mut flow = FlowField::zeros(coarse.w, coarse.h);

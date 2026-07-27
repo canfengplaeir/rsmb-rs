@@ -31,12 +31,14 @@ fn ffprobe_name(ffmpeg: &str) -> String {
 
 pub fn probe(ffmpeg: &str, input: &Path) -> Result<VideoInfo> {
     let ffprobe = ffprobe_name(ffmpeg);
+    // NOTE: csv output does NOT preserve the requested field order, so parse
+    // key=value pairs instead of positional columns.
     let out = Command::new(&ffprobe)
         .args([
             "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,r_frame_rate,nb_frames,duration",
-            "-of", "csv=p=0",
+            "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,duration",
+            "-of", "default=noprint_wrappers=1",
         ])
         .arg(input)
         .output()
@@ -48,36 +50,43 @@ pub fn probe(ffmpeg: &str, input: &Path) -> Result<VideoInfo> {
         ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let line = text
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .ok_or_else(|| anyhow!("ffprobe returned no stream info"))?;
-    let parts: Vec<&str> = line.trim().split(',').collect();
-    if parts.len() < 3 {
-        return Err(anyhow!("unexpected ffprobe output: {line}"));
-    }
-    let width: usize = parts[0].parse().context("bad width")?;
-    let height: usize = parts[1].parse().context("bad height")?;
-    let fps = parse_rate(parts[2])?;
-    if width == 0 || height == 0 || fps <= 0.0 {
-        return Err(anyhow!("invalid stream info: {line}"));
-    }
-    let total_frames: u64 = if parts.len() >= 4 {
-        parts[3].parse().unwrap_or(0)
-    } else {
-        0
-    };
-    let total_frames = if total_frames > 0 {
-        total_frames
-    } else if parts.len() >= 5 {
-        let duration: f64 = parts[4].parse().unwrap_or(0.0);
-        if duration > 0.0 {
-            (duration * fps).ceil() as u64
-        } else {
-            0
+    let mut width: Option<usize> = None;
+    let mut height: Option<usize> = None;
+    let mut r_fps: Option<f64> = None;
+    let mut avg_fps: Option<f64> = None;
+    let mut nb_frames: Option<u64> = None;
+    let mut duration: Option<f64> = None;
+    for line in text.lines() {
+        let Some((key, val)) = line.trim().split_once('=') else {
+            continue;
+        };
+        match key {
+            "width" => width = val.parse().ok(),
+            "height" => height = val.parse().ok(),
+            "r_frame_rate" => r_fps = parse_rate(val).ok().filter(|f| *f > 0.0),
+            "avg_frame_rate" => avg_fps = parse_rate(val).ok().filter(|f| *f > 0.0),
+            "nb_frames" => nb_frames = val.parse().ok(),
+            "duration" => duration = val.parse().ok(),
+            _ => {}
         }
-    } else {
-        0
+    }
+    let (width, height) = match (width, height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
+        _ => return Err(anyhow!("ffprobe returned no valid stream info")),
+    };
+    // avg_frame_rate tracks the real cadence of VFR sources; fall back to
+    // the nominal r_frame_rate.
+    let fps = match (avg_fps, r_fps) {
+        (Some(a), _) => a,
+        (None, Some(r)) => r,
+        _ => return Err(anyhow!("ffprobe returned no frame rate")),
+    };
+    let total_frames = match nb_frames {
+        Some(n) if n > 0 => n,
+        _ => match duration {
+            Some(d) if d > 0.0 => (d * fps).round() as u64,
+            _ => 0,
+        },
     };
     Ok(VideoInfo { width, height, fps, total_frames })
 }
@@ -159,11 +168,13 @@ impl Encoder {
                 "-hide_banner",
                 "-loglevel", "error",
                 "-y",
+                "-thread_queue_size", "512",
                 "-f", "rawvideo",
                 "-pix_fmt", "rgb24",
                 "-s", &size,
                 "-r", &fps_str,
                 "-i", "pipe:0",
+                "-thread_queue_size", "512",
                 "-i",
             ])
             .arg(input)

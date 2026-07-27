@@ -10,6 +10,7 @@
 
 mod blur;
 mod flow;
+mod gpu;
 mod video;
 
 use anyhow::Result;
@@ -71,6 +72,10 @@ struct Args {
     /// Reuse forward flow as negated backward flow (faster, minor quality loss).
     #[arg(long)]
     flow_cache: bool,
+
+    /// Use GPU acceleration (supports NVIDIA, AMD, Intel iGPU via wgpu).
+    #[arg(long)]
+    gpu: bool,
 }
 
 fn main() -> Result<()> {
@@ -83,16 +88,31 @@ fn main() -> Result<()> {
     let (w, h) = (info.width, info.height);
     let frame_size = w * h * 3;
 
+    let gpu_ctx: Option<gpu::GpuContext> = if args.gpu {
+        Some(gpu::GpuContext::new()?)
+    } else {
+        None
+    };
+
     let (raw_tx, raw_rx) = mpsc::sync_channel::<Option<Vec<u8>>>(16);
     let (proc_tx, proc_rx) = mpsc::sync_channel::<Vec<u8>>(8);
+    // Buffer pool: retired frame buffers are recycled by the decoder thread
+    // instead of cloning a fresh 6 MB buffer for every frame.
+    let (pool_tx, pool_rx) = mpsc::sync_channel::<Vec<u8>>(8);
 
     let dec_ffmpeg = args.ffmpeg.clone();
     let dec_input = args.input.clone();
     let dec_handle = thread::spawn(move || -> Result<()> {
         let mut dec = video::Decoder::new(&dec_ffmpeg, &dec_input)?;
-        let mut buf = vec![0u8; frame_size];
-        while dec.read_frame(&mut buf)? {
-            if raw_tx.send(Some(buf.clone())).is_err() {
+        loop {
+            let mut buf = match pool_rx.try_recv() {
+                Ok(b) => b,
+                Err(_) => vec![0u8; frame_size],
+            };
+            if !dec.read_frame(&mut buf)? {
+                break;
+            }
+            if raw_tx.send(Some(buf)).is_err() {
                 break;
             }
         }
@@ -144,8 +164,10 @@ fn main() -> Result<()> {
         if info.total_frames > 0 { info.total_frames.to_string() } else { "?".into() }
     ));
     pb.println(format!(
-        "params: shutter={}° samples={} window={} iters={} crf={} preset={}",
-        args.shutter, args.samples, args.window, args.iters, args.crf, args.preset
+        "params: shutter={}° samples={} window={} iters={} levels={} cache={} gpu={} crf={} preset={}",
+        args.shutter, args.samples, args.window, args.iters,
+        if args.levels > 0 { args.levels.to_string() } else { "auto".into() },
+        args.flow_cache, args.gpu, args.crf, args.preset
     ));
 
     let mut prev = vec![0u8; frame_size];
@@ -164,26 +186,53 @@ fn main() -> Result<()> {
         Err(_) => { next = vec![0u8; frame_size]; next.copy_from_slice(&cur); has_next = false; }
     }
 
-    let mut flow_cache: Option<(Vec<f32>, Vec<f32>, usize, usize)> = None;
+    // Grayscale conversions are cached and rotated together with the RGB
+    // frames, so each frame is converted exactly once (not 3x).
+    let mut gray_cur = flow::Gray::from_rgb(&cur, w, h);
+    let mut gray_next = flow::Gray::from_rgb(&next, w, h);
+    let mut gray_prev = gray_cur.clone(); // frame 0: duplicated neighbour
+
+    let mut flow_cache_cpu: Option<(Vec<f32>, Vec<f32>)> = None;
+    let mut flow_cache_gpu: Option<gpu::GpuFlowPair> = None;
 
     let mut n: u64 = 0;
     loop {
         let processed = if args.shutter <= 0.0 {
             cur.clone()
+        } else if let Some(ctx) = &gpu_ctx {
+            // ---- GPU path: flow fields never leave the device -----------
+            let flows = if args.flow_cache {
+                if let Some(cached) = flow_cache_gpu.take() {
+                    let bwd = gpu::gpu_negate_flow(ctx, &cached, w, h);
+                    let fwd = gpu::gpu_flow_single_device(
+                        ctx, &gray_cur.data, &gray_next.data, w, h, args.window, args.iters, args.levels,
+                    )?;
+                    flow_cache_gpu = Some(fwd.clone());
+                    gpu::GpuFrameFlows { fwd, bwd }
+                } else {
+                    let f = gpu::gpu_flows_device(
+                        ctx, &gray_cur.data, &gray_prev.data, &gray_next.data, w, h, args.window, args.iters, args.levels,
+                    )?;
+                    flow_cache_gpu = Some(f.fwd.clone());
+                    f
+                }
+            } else {
+                gpu::gpu_flows_device(
+                    ctx, &gray_cur.data, &gray_prev.data, &gray_next.data, w, h, args.window, args.iters, args.levels,
+                )?
+            };
+            gpu::gpu_motion_blur(ctx, &cur, &flows, w, h, args.shutter, args.samples)?
         } else {
-            let gray_prev = flow::Gray::from_rgb(if n == 0 { &cur } else { &prev }, w, h);
-            let gray_cur = flow::Gray::from_rgb(&cur, w, h);
-            let gray_next = flow::Gray::from_rgb(if has_next { &next } else { &cur }, w, h);
-
+            // ---- CPU path -------------------------------------------------
             let (fwd, bwd) = if args.flow_cache {
-                if let Some((cu, cv, cw, ch)) = flow_cache.take() {
+                if let Some((cu, cv)) = flow_cache_cpu.take() {
                     let neg_u: Vec<f32> = cu.iter().map(|v| -v).collect();
                     let neg_v: Vec<f32> = cv.iter().map(|v| -v).collect();
-                    let bwd = flow::FlowField { w: cw, h: ch, u: neg_u, v: neg_v };
+                    let bwd = flow::FlowField { w, h, u: neg_u, v: neg_v };
                     let fwd = flow::median_flow(&flow::optical_flow(
                         &gray_cur, &gray_next, args.window, args.iters, args.levels,
                     ));
-                    flow_cache = Some((fwd.u.clone(), fwd.v.clone(), fwd.w, fwd.h));
+                    flow_cache_cpu = Some((fwd.u.clone(), fwd.v.clone()));
                     (fwd, bwd)
                 } else {
                     let (fwd, bwd) = rayon::join(
@@ -194,7 +243,7 @@ fn main() -> Result<()> {
                             &gray_cur, &gray_prev, args.window, args.iters, args.levels,
                         )),
                     );
-                    flow_cache = Some((fwd.u.clone(), fwd.v.clone(), fwd.w, fwd.h));
+                    flow_cache_cpu = Some((fwd.u.clone(), fwd.v.clone()));
                     (fwd, bwd)
                 }
             } else {
@@ -223,27 +272,40 @@ fn main() -> Result<()> {
 
         std::mem::swap(&mut prev, &mut cur);
         std::mem::swap(&mut cur, &mut next);
+        std::mem::swap(&mut gray_prev, &mut gray_cur);
+        std::mem::swap(&mut gray_cur, &mut gray_next);
 
         match raw_rx.recv() {
             Ok(Some(frame)) => {
-                next = frame;
+                // Return the retired buffer (old `prev`, now scratch) to the
+                // decoder's pool instead of dropping it.
+                let retired = std::mem::replace(&mut next, frame);
+                let _ = pool_tx.send(retired);
+                gray_next = flow::Gray::from_rgb(&next, w, h);
             }
             Ok(None) => {
-                let gray_prev = flow::Gray::from_rgb(&prev, w, h);
-                let gray_cur = flow::Gray::from_rgb(&cur, w, h);
-
-                let (fwd, bwd) = rayon::join(
-                    || flow::median_flow(&flow::optical_flow(
-                        &gray_cur, &gray_cur, args.window, args.iters, args.levels,
-                    )),
-                    || flow::median_flow(&flow::optical_flow(
-                        &gray_cur, &gray_prev, args.window, args.iters, args.levels,
-                    )),
-                );
-
+                // Last frame: forward side duplicates the current frame.
                 let processed = if args.shutter <= 0.0 {
                     cur.clone()
+                } else if let Some(ctx) = &gpu_ctx {
+                    let flows = gpu::GpuFrameFlows {
+                        fwd: gpu::gpu_flow_single_device(
+                            ctx, &gray_cur.data, &gray_cur.data, w, h, args.window, args.iters, args.levels,
+                        )?,
+                        bwd: gpu::gpu_flow_single_device(
+                            ctx, &gray_cur.data, &gray_prev.data, w, h, args.window, args.iters, args.levels,
+                        )?,
+                    };
+                    gpu::gpu_motion_blur(ctx, &cur, &flows, w, h, args.shutter, args.samples)?
                 } else {
+                    let (fwd, bwd) = rayon::join(
+                        || flow::median_flow(&flow::optical_flow(
+                            &gray_cur, &gray_cur, args.window, args.iters, args.levels,
+                        )),
+                        || flow::median_flow(&flow::optical_flow(
+                            &gray_cur, &gray_prev, args.window, args.iters, args.levels,
+                        )),
+                    );
                     blur::motion_blur(&cur, w, h, &fwd, &bwd, args.shutter, args.samples)
                 };
 
@@ -261,10 +323,17 @@ fn main() -> Result<()> {
     }
 
     drop(proc_tx);
+    drop(pool_tx);
 
     dec_handle.join().map_err(|_| anyhow::anyhow!("decoder thread panicked"))??;
     enc_handle.join().map_err(|_| anyhow::anyhow!("encoder thread panicked"))??;
 
+    if info.total_frames > 0 && n != info.total_frames {
+        pb.println(format!(
+            "WARNING: processed {} frames but input reports {} — output may be truncated",
+            n, info.total_frames
+        ));
+    }
     pb.finish_with_message(format!("done — {} frames", n));
     println!("output: {}", args.output.display());
     Ok(())

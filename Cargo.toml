@@ -9,6 +9,9 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 rayon = "1"
 indicatif = "0.17"
+wgpu = "0.19"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.3"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
